@@ -24,6 +24,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional
 
 from env_config import get_bool, get_env, get_int, get_required_secret, load_project_env_once
 from security_capabilities import ECDH_P256_WARNING, security_capability_output
+from v2x_evidence_admission import EvidenceAdmissionGate
 
 load_project_env_once()
 logger = logging.getLogger("SmartCarV2X")
@@ -812,6 +813,8 @@ class V2XHub:
         *,
         node_key_registry: Optional[Dict[str, str]] = None,
         shared_secret: Optional[str] = None,
+        evidence_policy: Optional[str] = None,
+        capture_exporter: Optional[Any] = None,
     ):
         self.host = host or get_env("SMARTCAR_V2X_HOST", "127.0.0.1")
         self.port = port or get_int("SMARTCAR_V2X_PORT", 9988)
@@ -836,6 +839,12 @@ class V2XHub:
                 "global V2X PSK fallback is disabled by default"
             )
 
+        # A research exporter is NEVER implicitly enabled from environment.
+        # Explicit caller-owned exporter receives only actual hub-verified
+        # ALERTs and is responsible for its own private file lifecycle.
+        if capture_exporter is not None and not callable(getattr(capture_exporter, "record_verified", None)):
+            raise TypeError("capture_exporter must implement record_verified")
+        self._capture_exporter = capture_exporter
         self._running = False
         self._sock: Optional[socket.socket] = None
         self._lock = threading.Lock()
@@ -843,6 +852,20 @@ class V2XHub:
         self._hello_replay_cache: Dict[str, float] = {}
         self._msg_ts_hist: Deque[float] = deque(maxlen=1024)
         self._latency_hint_ms = float(get_env("SMARTCAR_V2X_HUB_LATENCY_HINT_MS", "20.0"))
+        # This is opt-in and applies only to *network event relaying*.
+        # It does not block or authorize any local emergency safety action.
+        self._evidence_mode = str(
+            evidence_policy if evidence_policy is not None
+            else get_env("SMARTCAR_V2X_EVIDENCE_POLICY", "off")
+        ).strip().lower()
+        if self._evidence_mode not in {"off", "shadow", "enforce"}:
+            raise ValueError("SMARTCAR_V2X_EVIDENCE_POLICY must be off, shadow or enforce")
+        self._evidence_gate = (
+            EvidenceAdmissionGate(
+                quorum=get_int("SMARTCAR_V2X_EVIDENCE_QUORUM", 2),
+                max_incidents=get_int("SMARTCAR_V2X_EVIDENCE_MAX_INCIDENTS", 2048),
+            ) if self._evidence_mode != "off" else None
+        )
 
     def _node_secret(self, node_id: str) -> str:
         if self._node_key_registry:
@@ -1051,6 +1074,15 @@ class V2XHub:
             logger.warning("Dropping invalid/replayed V2X message from %s", node_id)
             return
 
+        if mtype == V2XMessageType.ALERT and self._capture_exporter is not None:
+            # The exporter is invoked only after the actual MAC, source-ID,
+            # nonce and session checks above. Research I/O failure must not
+            # interrupt live transport or independent local safety controls.
+            try:
+                self._capture_exporter.record_verified(msg, bound_sender_id=node_id)
+            except Exception:
+                logger.exception("Optional V2X research capture export failed")
+
         if mtype == V2XMessageType.PING:
             pong = _new_message(
                 V2XMessageType.PONG,
@@ -1062,7 +1094,28 @@ class V2XHub:
             self._send_raw(conn, pong)
             return
 
+        if mtype in (V2XMessageType.ALERT, V2XMessageType.V2I_SIGNAL) and self._evidence_gate:
+            # This happens ONLY after authenticated connection identity, MAC,
+            # timestamp and replay validation. Payload-provided IDs cannot vote.
+            decision = self._evidence_gate.evaluate(
+                authenticated_sender_id=node_id, payload=msg.get("payload")
+            )
+            logger.info(
+                "V2X incident admission mode=%s decision=%s reason=%s",
+                self._evidence_mode, decision.status, decision.reason
+            )
+            if self._evidence_mode == "enforce" and not decision.relayed:
+                return
+            # Shadow deliberately preserves legacy forwarding for unbiased
+            # detection/availability trade-off measurement.
         self._broadcast(msg, exclude=conn)
+
+    def evidence_admission_status(self) -> Dict[str, Any]:
+        """Non-sensitive aggregate counters; no names or sensor data."""
+        if self._evidence_gate is None:
+            return {"mode": "off", "enabled": False}
+        return {"mode": self._evidence_mode, "enabled": True,
+                **self._evidence_gate.snapshot()}
 
     def _send_raw(self, conn: socket.socket, message: Dict[str, Any]) -> bool:
         try:
