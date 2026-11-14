@@ -351,3 +351,21 @@ Draft branch `authenticate-arduino-serial-ingress` removes raw unsigned Arduino 
 - **PARTIAL / NOT EXECUTED:** `python -m unittest tests.test_durable_command_multiprocess -v` and `python -m unittest tests.test_hardware_command_receiver_simulator -v` remain to be executed. The current runner could not resolve github.com for a local checkout. No concurrency success, crash durability, or statistical claim is made.
 - **BLOCKED:** power-cut fault injection, WAL/database rollback resistance, authenticated receiver acknowledgments, firmware interoperability, independent local emergency-stop testing.
 - **UPCOMING:** execute the multiprocess suite on Linux and Windows; inject process termination at transaction boundaries, then implement challenge-bound authenticated simulation acknowledgments with negative tamper tests. These synthetic tests are not main-paper research evidence.
+
+## Production Go ledger save durability — draft PR #96 (issue #95)
+
+- **IMPLEMENTED / UNVERIFIED:** Go `/save` uses a same-directory private temp file, file fsync, one rename, POSIX parent-directory fsync, and preserves the old destination on rename failure. Concurrent saves are serialized within one process and invalid chain snapshots are rejected.
+- **VALIDATION PENDING:** `cd api/go && go test -count=1 ./... && go vet ./...` and Linux `go test -race -count=1 ./...` must run on the reconciled branch. No physical power-loss or cross-process multiwriter durability claim.
+- **BLOCKED:** startup recovery, automatic per-append persistence, host rollback resistance, true consensus finality and hardware interlock evidence.
+
+## Zero-observation V2X interval accounting (draft PR #97)
+
+- **IMPLEMENTED / EXECUTION PENDING:** An independently labelled positive incident with an authenticated header-only capture is retained as a missed hazard (false negative), rather than excluded from the denominator. Empty world truth and malformed/headerless captures remain invalid.
+- **TEST COMMAND:** `PYTHONPATH=experiments/v2x python -m unittest discover -s experiments/v2x -p test_join_world_incidents.py -v` (not executed in this merge-resolution session).
+- **BLOCKED:** independently trusted ground truth, authenticated capture interval provenance and matched real incident evaluation. Synthetic regression fixtures are not publishable main results.
+
+## Arduino serial ingress PR #98 reconciliation
+
+- **SUPERSEDED:** PR #98's unsigned JSON framing implementation is not safe to transplant: current main already requires enrolled authenticated serial envelopes, bounded streaming and quarantine. Preserve main's authentication and actuator gate.
+- **ADDED (NOT EXECUTED):** `tests/test_serial_ingress_bounds.py` now checks the authenticated-only serial entrypoint and bounded/quarantine source invariants. Run `python -m unittest discover -s tests -p 'test_serial_ingress_bounds.py' -v` plus `python -m unittest discover -s tests -p 'test_arduino_authenticated_ingress.py' -v` before merge.
+- **BLOCKED:** physical serial/ECU verification, independent local emergency stop and hardware interlocks; these tests are not paper efficacy evidence.
