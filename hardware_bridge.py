@@ -21,6 +21,7 @@ from typing import Optional
 
 from env_config import load_project_env_once, get_env, get_int, get_bool
 from blockchain import SmartCarBlockchain, TelemetryData
+from hardware_nonce_store import SQLiteNonceStore
 from bounded_tcp_admission import BoundedTCPAdmission
 from hardware_actuation_safety import BenchActuationGate
 from hardware_transport_deadlines import deadline_check, DeadlineExpired
@@ -139,6 +140,16 @@ def to_telemetry(pkt: dict) -> TelemetryData:
     )
 
 
+def _signed_event_label(value):
+    """Reject ambiguous or resource-heavy signed event labels before ledger mutation."""
+    # Match transport MAX_EVENT_BYTES (UTF-8 bytes, not code points).
+    if type(value) is not str or not value or len(value.encode("utf-8")) > 160:
+        raise ValueError("event: nonempty bounded UTF-8 string required")
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError("event: control characters forbidden")
+    return value
+
+
 class GlobalTelemetryBudget:
     """Bound aggregate authenticated ledger mutations across TCP sessions.
 
@@ -179,15 +190,24 @@ class AuthenticatedPiTelemetrySession:
         self.framer = AuthenticatedLineFramer(verifier.max_frame_bytes)
         self.device_id = None
 
-    def receive(self, data: bytes):
-        verified = []
+    def receive_iter(self, data: bytes):
+        """Yield verified frames individually so a later bad MAC cannot discard
+        an earlier valid frame after its nonce has been claimed.
+
+        This is NOT ledger/replay atomicity: a ledger failure after verification
+        can still consume the nonce. Framing errors fail the entire read.
+        """
         for frame in self.framer.feed(data):
             item = self.verifier.verify(
                 frame, expected_kind="TELEMETRY", expected_device_id=self.device_id
             )
             self.device_id = item.device_id
-            verified.append(item)
-        return verified
+            yield item
+
+    def receive(self, data: bytes):
+        # Legacy eager API retained for existing callers. Production ingress
+        # must use receive_iter to avoid a batch-wide delivery loss.
+        return list(self.receive_iter(data))
 
 
 class SafeModeActuatorDispatcher:
@@ -317,7 +337,7 @@ def run_arduino_mode(bc: SmartCarBlockchain):
             ingress_utc = datetime.now(timezone.utc)
             last_progress = ingress_monotonic
             try:
-                verified = session.receive(chunk)
+                verified = session.receive_iter(chunk)
             except HardwareTransportError as exc:
                 print(f"[HW BRIDGE] quarantined Arduino serial input: {exc.reason}")
                 raise RuntimeError("Arduino serial authentication/framing failure") from exc
@@ -336,7 +356,7 @@ def run_arduino_mode(bc: SmartCarBlockchain):
                     max_future_skew_seconds=max(0, min(60, get_int("SMARTCAR_HW_OBSERVATION_FUTURE_SKEW_SEC", 2))),
                 )
                 tel = to_telemetry(item.payload)
-                event = str(item.payload["event"])
+                event = _signed_event_label(item.payload.get("event"))
                 block = bc.push_telemetry(tel, event)
                 print(f"[CHAIN] block={block.index} event={event}")
                 actuator.maybe_send_arduino(
@@ -358,8 +378,17 @@ def run_pi_mode(bc: SmartCarBlockchain):
     port = get_int("SMARTCAR_HW_BRIDGE_PORT", 9901)
     # Startup fails closed if no independent enrolled Pi secrets are configured.
     device_keys = parse_device_registry(get_env("SMARTCAR_HW_DEVICE_KEYS_JSON", "{}"))
+    # No volatile-only replay fallback for production Pi TCP. Provision once
+    # with SMARTCAR_HW_NONCE_STORE_PROVISION=true, then restart in recovery mode.
+    nonce_path = get_env("SMARTCAR_HW_NONCE_STORE_PATH", "").strip()
+    if not nonce_path:
+        raise RuntimeError("SMARTCAR_HW_NONCE_STORE_PATH required for Pi ingress")
+    nonce_store = SQLiteNonceStore(
+        nonce_path, provision=get_bool("SMARTCAR_HW_NONCE_STORE_PROVISION", False)
+    )
     verifier = HardwareEnvelopeVerifier(
         device_keys,
+        durable_nonce_store=nonce_store,
         max_frame_bytes=get_int("SMARTCAR_HW_MAX_FRAME_BYTES", 32 * 1024),
         replay_window_sec=get_int("SMARTCAR_HW_REPLAY_WINDOW_SEC", 15),
         replay_cache_entries=get_int("SMARTCAR_HW_REPLAY_CACHE_ENTRIES", 2048),
@@ -439,8 +468,9 @@ def run_pi_mode(bc: SmartCarBlockchain):
                         raise HardwareTransportError(str(exc)) from exc
                     # Verify MAC, freshness, replay nonce, schema, and per-
                     # connection identity before *any* ledger/actuation side effect.
-                    with verifier_lock:
-                        verified_items = session.receive(data)
+                    # The verifier owns its replay lock. Do not hold a global
+                    # lock across ledger I/O while iterating verified frames.
+                    verified_items = session.receive_iter(data)
                     for item in verified_items:
                         # A single recv may contain many signed frames. MAC
                         # verification can itself consume the remaining
@@ -473,7 +503,7 @@ def run_pi_mode(bc: SmartCarBlockchain):
                             max_future_skew_seconds=max(0, min(60, get_int("SMARTCAR_HW_OBSERVATION_FUTURE_SKEW_SEC", 2))),
                         )
                         tel = to_telemetry(item.payload)
-                        event = str(item.payload["event"])
+                        event = _signed_event_label(item.payload.get("event"))
                         with ledger_lock:
                             block = bc.push_telemetry(tel, event)
                         # Network sendall may block for the peer's socket timeout.
